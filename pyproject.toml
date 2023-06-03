@@ -50,6 +50,7 @@ dependencies = [
     "transformers@git+https://github.com/huggingface/transformers",
     "wandb",
     "tensorboardX",
+    "einops"
 ]
 
 [project.optional-dependencies]
