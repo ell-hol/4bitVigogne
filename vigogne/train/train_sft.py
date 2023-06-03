@@ -14,11 +14,12 @@ import bitsandbytes as bnb
 import datasets
 import numpy as np
 import torch
+import torch.nn as nn
 import transformers
 from accelerate import Accelerator
 from datasets import DatasetDict, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict, prepare_model_for_int8_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, Trainer, TrainingArguments, BitsAndBytesConfig
 
 from vigogne.constants import (
     CHAT,
@@ -223,19 +224,49 @@ def train():
     n_gpus = torch.cuda.device_count()
     max_memory = {i: max_memory for i in range(n_gpus)}
     
-    # if model_args.load_in_4bit:
+    quantization_config=None
+    if model_args.load_in_4bit:
+        quantization_config=BitsAndBytesConfig(
+        load_in_4bit=True,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+        )
         
     
     # Load model and tokenizer
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         max_memory = max_memory,
+        quantization_config=quantization_config,
         torch_dtype=precision,
         load_in_8bit=model_args.load_in_8bit,
         load_in_4bit=model_args.load_in_4bit,
         device_map={"": Accelerator().process_index},
         use_cache=not training_args.gradient_checkpointing,
     )
+    
+    """### Post-processing on the model
+
+    Finally, we need to apply some post-processing on the 8-bit model to enable training, let's freeze all our layers, and cast the layer-norm in `float32` for stability. We also cast the output of the last layer in `float32` for the same reasons.
+    """
+
+    print(model)
+
+    for param in model.parameters():
+        param.requires_grad = False  # freeze the model - train adapters later
+        if param.ndim == 1:
+            # cast the small parameters (e.g. layernorm) to fp32 for stability
+            param.data = param.data.to(torch.float32)
+            
+    class CastOutputToFloat(nn.Sequential):
+        def forward(self, x):
+            return super().forward(x).to(torch.float32)
+
+
+    model.lm_head = CastOutputToFloat(model.lm_head)
 
     # fast version llama for "with you.</s>"
     tokenizer = AutoTokenizer.from_pretrained(
