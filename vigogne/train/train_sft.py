@@ -49,6 +49,9 @@ class ModelArguments:
     load_in_8bit: bool = field(
         default=False, metadata={"help": "Whether to convert the loaded model into mixed-8bit quantized model."}
     )
+    load_in_4bit: bool = field(
+        default=False, metadata={"help": "Whether to convert the loaded model into mixed-4bit quantized model."}
+    )
 
 
 @dataclass
@@ -107,7 +110,10 @@ class DataArguments:
 class VigogneTrainingArguments(TrainingArguments):
     optim: str = field(default="adamw_torch", metadata={"help": "Optimizer to use."})
     fp16: bool = field(
-        default=True, metadata={"help": "Whether to use fp16 16-bit (mixed) precision training instead of 32-bit training."}
+        default=False, metadata={"help": "Whether to use fp16 16-bit (mixed) precision training instead of 32-bit training."}
+    )
+    bf16: bool = field(
+        default=False, metadata={"help": "Whether to use fp16 16-bit (mixed) precision training instead of 32-bit training."}
     )
 
 
@@ -197,19 +203,36 @@ def train():
     # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, fp16-bits training: {training_args.fp16}, bf16-bits training: {training_args.bf16}"
     )
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Model parameters {model_args}")
     logger.info(f"LoRA parameters {lora_args}")
     logger.info(f"Data parameters {data_args}")
     logger.info(f"Training/evaluation parameters {training_args}")
+    
+    precision = "auto"
+    if training_args.bf16:
+        precision = torch.bfloat16
+    elif training_args.fp16:
+        preicison = torch.fp16
+    
+    free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024**3)
+    max_memory = f"{free_in_GB-2}GB"
 
+    n_gpus = torch.cuda.device_count()
+    max_memory = {i: max_memory for i in range(n_gpus)}
+    
+    # if model_args.load_in_4bit:
+        
+    
     # Load model and tokenizer
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
-        torch_dtype=torch.float16,
+        max_memory = max_memory,
+        torch_dtype=precision,
         load_in_8bit=model_args.load_in_8bit,
+        load_in_4bit=model_args.load_in_4bit,
         device_map={"": Accelerator().process_index},
         use_cache=not training_args.gradient_checkpointing,
     )
@@ -218,7 +241,7 @@ def train():
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         padding_side="right",
-        use_fast=False,
+        use_fast=True,
     )
     # llama has no pad token, like gpt2
     # Some special tokens can be "" or None depending on releases
@@ -239,6 +262,7 @@ def train():
     )
 
     if model_args.load_in_8bit:
+        print("\n##################### 8BIT!############\n")
         # Cast the small parameters (e.g. layernorm) to fp32 for stability
         model = prepare_model_for_int8_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
     elif training_args.gradient_checkpointing:
@@ -330,7 +354,7 @@ def train():
         eval_dataset=eval_dataset if data_args.eval_file is not None else None,
         args=training_args,
         data_collator=DataCollatorForSupervisedDataset(
-            tokenizer=tokenizer, pad_to_multiple_of=8 if training_args.fp16 else None
+            tokenizer=tokenizer, pad_to_multiple_of=8 if (training_args.fp16 or training_args.bf16) else None
         ),
         callbacks=[SavePeftModelCallback, LoadBestPeftModelCallback],
     )
